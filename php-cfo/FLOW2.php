@@ -115,21 +115,49 @@ class FLOW2
 
     private function _init_search()
     {
+        $this->_step_lb = INF;
         $this->_tunable_keys = [];
         $this->_bounded_keys = [];
         $this->_unordered_cat_hp = [];
         $this->hierarchical = false;
 
         foreach ($this->_space as $key => $domain) {
-            // In PHP, there is no direct equivalent of `isinstance(domain, dict) and "grid_search" in domain`.
-            // I will assume that the space is well-formed and does not contain grid search domains.
-            // Also, there is no direct equivalent of `callable(getattr(domain, "get_sampler", None))`.
-            // I will assume that all domains are tunable.
+            // Assuming domain is an array which may contain 'grid_search' key
+            if (isset($domain['grid_search'])) {
+                continue;
+            }
             $this->_tunable_keys[] = $key;
+            if (isset($domain['q'])) { // Quantized
+                $q = $domain['q'];
+                if (isset($domain['log']) && $domain['log']) {
+                    // Log uniform - step_lb is dependent on current value, calculated in get_step_lower_bound
+                } else {
+                    $this->_step_lb = min($this->_step_lb, $q / ($domain['upper'] - $domain['lower'] + 1));
+                }
+            } elseif (isset($domain['upper'])) { // Uniform
+                if (isset($domain['log']) && $domain['log']) {
+                    // Log uniform - step_lb is dependent on current value, calculated in get_step_lower_bound
+                } else {
+                    $this->_step_lb = min($this->_step_lb, 1.0 / ($domain['upper'] - $domain['lower']));
+                }
+            }
 
-            // I will need to implement the logic for handling different types of domains (e.g., uniform, quantized, categorical).
-            // For now, I will assume all domains are uniform.
-            $this->_bounded_keys[] = $key;
+            if (isset($domain['categories'])) { // Categorical
+                if (!($domain['ordered'] ?? true)) {
+                    $this->_unordered_cat_hp[$key] = count($domain['categories']);
+                }
+                if (!$this->hierarchical) {
+                    foreach ($domain['categories'] as $cat) {
+                        if (is_array($cat)) {
+                            $this->hierarchical = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!(isset($domain['sampler']) && $domain['sampler'] == 'normal')) {
+                $this->_bounded_keys[] = $key;
+            }
         }
 
         if (!$this->hierarchical) {
@@ -148,7 +176,7 @@ class FLOW2
         }
 
         $this->incumbent = [];
-        $this->incumbent = $this->normalize($this->best_config); // flattened
+        $this->incumbent = $this->normalize($this->best_config, false); // flattened
         $this->best_obj = null;
         $this->cost_incumbent = null;
         $this->dim = count($this->_tunable_keys);
@@ -180,9 +208,28 @@ class FLOW2
 
     private function get_step_lower_bound()
     {
-        // I will need to implement the logic for calculating the step lower bound.
-        // For now, I will return a constant value.
-        return self::STEP_LOWER_BOUND;
+        $step_lb = $this->_step_lb;
+        foreach ($this->_tunable_keys as $key) {
+            if (!isset($this->best_config[$key])) {
+                continue;
+            }
+            $domain = $this->_space[$key];
+            // Assuming domain is an array with 'lower' and 'upper' bounds for numeric types
+            // and 'q' for quantized domains.
+            if (isset($domain['log']) && $domain['log']) {
+                if (isset($domain['q'])) {
+                    $step_lb = min($step_lb, log(1 + $domain['q'] / $this->best_config[$key]) / log($domain['upper'] / $domain['lower']));
+                } else {
+                    $step_lb = min($step_lb, log(1 + 1 / $this->best_config[$key]) / log(($domain['upper'] - 1) / $domain['lower']));
+                }
+            }
+        }
+        if (is_infinite($step_lb)) {
+            $step_lb = self::STEP_LOWER_BOUND;
+        } else {
+            $step_lb *= $this->step_ub;
+        }
+        return $step_lb;
     }
 
     private function _min_resource()
@@ -204,12 +251,9 @@ class FLOW2
         foreach ($config as $key => $value) {
             if (isset($this->_space[$key])) {
                 $domain = $this->_space[$key];
-                // Assuming domain is an array with 'lower' and 'upper' bounds for numeric types
                 if (is_numeric($value) && isset($domain['lower']) && isset($domain['upper'])) {
                     $normalized_config[$key] = ($value - $domain['lower']) / ($domain['upper'] - $domain['lower']);
                 } else {
-                    // For categorical data, normalization might mean converting to an index
-                    // For now, we'll just pass the value through.
                     $normalized_config[$key] = $value;
                 }
             }
@@ -261,6 +305,23 @@ class FLOW2
         return $this->unflatten_dict($config);
     }
 
+    private function rand_vector_gaussian(int $dim, float $std = 1.0): array
+    {
+        $vec = [];
+        for ($i = 0; $i < $dim; $i += 2) {
+            // Box-Muller transform
+            $u1 = mt_rand() / mt_getrandmax();
+            $u2 = mt_rand() / mt_getrandmax();
+            $z1 = sqrt(-2 * log($u1)) * cos(2 * M_PI * $u2);
+            $z2 = sqrt(-2 * log($u1)) * sin(2 * M_PI * $u2);
+            $vec[] = $z1 * $std;
+            if (count($vec) < $dim) {
+                $vec[] = $z2 * $std;
+            }
+        }
+        return $vec;
+    }
+
     private function rand_vector_unit_sphere(int $dim, float $std = 1.0): array
     {
         $vec = [];
@@ -268,7 +329,12 @@ class FLOW2
             $vec[] = (mt_rand() / mt_getrandmax() - 0.5) * 2 * $std;
         }
         if ($this->_trunc > 0 && $this->_trunc < $dim) {
-            // I will need to implement the truncation logic.
+            $abs_vec = array_map('abs', $vec);
+            asort($abs_vec);
+            $keys = array_keys($abs_vec);
+            for ($i = 0; $i < $dim - $this->_trunc; $i++) {
+                $vec[$keys[$i]] = 0;
+            }
         }
         $mag = sqrt(array_sum(array_map(function ($x) {
             return $x * $x;
@@ -295,15 +361,12 @@ class FLOW2
         foreach ($config as $key => $value) {
             if (isset($this->_space[$key])) {
                 $domain = $this->_space[$key];
-                // Assuming domain is an array with 'lower' and 'upper' bounds for numeric types
                 if (is_numeric($value) && isset($domain['lower']) && isset($domain['upper'])) {
                     $denormalized_config[$key] = $value * ($domain['upper'] - $domain['lower']) + $domain['lower'];
                     if (isset($domain['q'])) {
                         $denormalized_config[$key] = round($denormalized_config[$key] / $domain['q']) * $domain['q'];
                     }
                 } else {
-                    // For categorical data, denormalization might mean converting an index back to a value
-                    // For now, we'll just pass the value through.
                     $denormalized_config[$key] = $value;
                 }
             }
@@ -321,7 +384,7 @@ class FLOW2
                 if ($this->best_obj === null || $obj < $this->best_obj) {
                     $this->best_obj = $obj;
                     list($this->best_config, $this->step) = $this->_configs[$trial_id];
-                    $this->incumbent = $this->normalize($this->best_config);
+                    $this->incumbent = $this->normalize($this->best_config, false);
                     $this->cost_incumbent = $result[$this->cost_attr] ?? 1;
                     if ($this->_resource) {
                         $this->_resource = $this->best_config[$this->resource_attr];
@@ -376,7 +439,7 @@ class FLOW2
                         if ($this->_resource) {
                             $this->_resource = $config[$this->resource_attr];
                         }
-                        $this->incumbent = $this->normalize($this->best_config);
+                        $this->incumbent = $this->normalize($this->best_config, false);
                         $this->cost_incumbent = $result[$this->cost_attr] ?? 1;
                         $this->_cost_complete4incumbent = 0;
                         $this->_num_complete4incumbent = 0;
@@ -426,12 +489,9 @@ class FLOW2
 
     public function complete_config(array $partial_config, array $lower = null, array $upper = null): array
     {
-        // This is a simplified version of the complete_config method.
-        // A full implementation would require a more sophisticated way to handle different domain types.
         $config = $partial_config;
         foreach ($this->_space as $key => $domain) {
             if (!isset($config[$key])) {
-                // For now, we will just use the lower bound of the domain as the default value.
                 if (isset($domain['lower'])) {
                     $config[$key] = $domain['lower'];
                 } elseif (isset($domain['categories'])) {
@@ -440,5 +500,35 @@ class FLOW2
             }
         }
         return [$config, $this->space];
+    }
+
+    public function create(array $init_config, $obj, float $cost, array $space): self
+    {
+        $this->seed++;
+        $flow2 = new self(
+            $init_config,
+            $this->metric,
+            $this->mode,
+            $space,
+            $this->resource_attr,
+            $this->min_resource,
+            $this->max_resource,
+            $this->resource_multiple_factor,
+            $this->cost_attr,
+            $this->seed,
+            $this->lexico_objectives
+        );
+        if ($this->lexico_objectives !== null) {
+            $flow2->best_obj = [];
+            foreach ($obj as $k => $v) {
+                $metric_index = array_search($k, $this->lexico_objectives['metrics']);
+                $mode = $this->lexico_objectives['modes'][$metric_index];
+                $flow2->best_obj[$k] = ($mode === 'max') ? -$v : $v;
+            }
+        } else {
+            $flow2->best_obj = $obj * $this->metric_op;
+        }
+        $flow2->cost_incumbent = $cost;
+        return $flow2;
     }
 }

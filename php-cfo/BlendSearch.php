@@ -4,6 +4,9 @@ namespace Flaml\Tune\Searcher;
 
 require_once 'FLOW2.php';
 require_once 'SearchThread.php';
+require_once 'utils.php';
+
+use function Flaml\Tune\indexof;
 
 class BlendSearch
 {
@@ -349,7 +352,14 @@ class BlendSearch
 
     private function _create_thread(array $config, array $result, array $space)
     {
-        $obj = $result[$this->_ls->metric];
+        if ($this->lexico_objectives === null) {
+            $obj = $result[$this->_ls->metric];
+        } else {
+            $obj = [];
+            foreach ($this->lexico_objectives['metrics'] as $metric) {
+                $obj[$metric] = $result[$metric];
+            }
+        }
         $this->_search_thread_pool[$this->_thread_count] = new SearchThread(
             $this->_ls->mode,
             $this->_ls->create(
@@ -362,6 +372,78 @@ class BlendSearch
             $this->_eps
         );
         $this->_thread_count++;
+        $this->_update_admissible_region(
+            $this->_ls->unflatten_dict($config),
+            $this->_ls_bound_min,
+            $this->_ls_bound_max,
+            $space,
+            $this->_ls->space
+        );
+    }
+
+    private function _update_admissible_region(array $config, array &$admissible_min, array &$admissible_max, array $subspace, array $space)
+    {
+        $normalized_config = $this->_ls->normalize($config, true);
+        foreach ($admissible_min as $key => &$value) {
+            $v = $normalized_config[$key];
+            if (is_array($admissible_max[$key])) {
+                $domain = $space[$key];
+                $choice_v = is_array($v) ? $v[count($v) - 1] : $v;
+                $choice = indexof($domain, $choice_v);
+                if ($choice !== null) {
+                    $this->_update_admissible_region(
+                        $v,
+                        $admissible_min[$key][$choice],
+                        $admissible_max[$key][$choice],
+                        $subspace[$key],
+                        $domain['categories'][$choice]
+                    );
+                    if (is_array($admissible_max[$key]) && count($admissible_max[$key]) > count($domain['categories'])) {
+                        $normal = ($choice + 0.5) / count($domain['categories']);
+                        $admissible_max[$key][count($admissible_max[$key]) - 1] = max($normal, $admissible_max[$key][count($admissible_max[$key]) - 1]);
+                        $admissible_min[$key][count($admissible_min[$key]) - 1] = min($normal, $admissible_min[$key][count($admissible_min[$key]) - 1]);
+                    }
+                }
+            } elseif (is_array($v)) {
+                $this->_update_admissible_region(
+                    $v,
+                    $admissible_min[$key],
+                    $admissible_max[$key],
+                    $subspace[$key],
+                    $space[$key]
+                );
+            } else {
+                if ($v > $admissible_max[$key]) {
+                    $admissible_max[$key] = $v;
+                } elseif ($v < $admissible_min[$key]) {
+                    $admissible_min[$key] = $v;
+                }
+            }
+        }
+    }
+
+    private function _create_thread_from_best_candidate()
+    {
+        $best_trial_id = null;
+        $obj_best = null;
+        foreach ($this->_candidate_start_points as $trial_id => $r) {
+            if ($r && ($best_trial_id === null || $r[$this->_ls->metric] * $this->_ls->metric_op < $obj_best)) {
+                $best_trial_id = $trial_id;
+                $obj_best = $r[$this->_ls->metric] * $this->_ls->metric_op;
+            }
+        }
+        if ($best_trial_id) {
+            $config = [];
+            $result = $this->_candidate_start_points[$best_trial_id];
+            foreach ($result as $key => $value) {
+                if (strpos($key, 'config/') === 0) {
+                    $config[substr($key, 7)] = $value;
+                }
+            }
+            $this->_started_from_given = true;
+            unset($this->_candidate_start_points[$best_trial_id]);
+            $this->_create_thread($config, $result, $this->_subspace[$best_trial_id] ?? $this->_ls->space);
+        }
     }
 
     private function _clean(int $thread_id)

@@ -31,7 +31,7 @@ class CFO extends BlendSearch
         if (isset($this->_candidate_start_points[$trial_id])) {
             $this->_candidate_start_points[$trial_id] = $result;
             if (count($this->_search_thread_pool) < 2 && !$this->_points_to_evaluate) {
-                // Not implemented yet
+                $this->_create_thread_from_best_candidate();
             }
         }
     }
